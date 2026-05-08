@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import json
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Set
 
 import yfinance as yf
 
@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 from tradingagents.llm_clients import create_llm_client
 
 from tradingagents.agents import *
+from tradingagents.agents.schemas import build_run_snapshot
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.utils import safe_ticker_component
@@ -30,6 +31,8 @@ from .setup import GraphSetup
 from .propagation import Propagator
 from .reflection import Reflector
 from .signal_processing import SignalProcessor
+
+from tradingagents.dataflows.interface import clear_session_cache
 
 
 class TradingAgentsGraph:
@@ -101,6 +104,10 @@ class TradingAgentsGraph:
         self.curr_state = None
         self.ticker = None
         self.log_states_dict: Dict[str, Any] = {}
+        # In-session cache for _fetch_returns: keyed by (ticker, trade_date).
+        # Only successful (non-None) fetches are cached so transient failures
+        # are retried on the next call within the same session.
+        self._returns_cache: Dict[Tuple[str, str], Tuple[float, float, int]] = {}
 
         self.workflow = self.graph_setup.setup_graph(selected_analysts)
         self.graph = self.workflow.compile()
@@ -137,9 +144,17 @@ class TradingAgentsGraph:
     ) -> Tuple[Optional[float], Optional[float], Optional[int]]:
         """Fetch raw and alpha return for ticker over holding_days from trade_date.
 
+        Results are cached in-session by (ticker, trade_date) so that a busy
+        backtest loop resolving many pending entries for the same ticker/date
+        pair only hits the network once per session.
+
         Returns (raw_return, alpha_return, actual_holding_days) or
         (None, None, None) if price data is unavailable.
         """
+        cache_key = (ticker, trade_date)
+        if cache_key in self._returns_cache:
+            return self._returns_cache[cache_key]
+
         try:
             start = datetime.strptime(trade_date, "%Y-%m-%d")
             end = start + timedelta(days=holding_days + 7)
@@ -161,7 +176,9 @@ class TradingAgentsGraph:
                 / spy["Close"].iloc[0]
             )
             alpha = raw - spy_ret
-            return raw, alpha, actual_days
+            result = (raw, alpha, actual_days)
+            self._returns_cache[cache_key] = result  # only cache successful fetches
+            return result
         except Exception as e:
             logger.warning(
                 "Could not resolve outcome for %s on %s (will retry next run): %s",
@@ -169,15 +186,20 @@ class TradingAgentsGraph:
             )
             return None, None, None
 
-    def _resolve_pending_entries(self, ticker: str) -> None:
-        """Resolve pending log entries for ticker at the start of a new run."""
-        pending = [e for e in self.memory_log.get_pending_entries() if e["ticker"] == ticker]
+    def _resolve_pending_entries(self) -> None:
+        """Resolve ALL pending log entries at the start of a new run.
+
+        Resolves across all tickers so that entries from previous tickers
+        don't silently accumulate forever — they just need any propagate()
+        call to trigger resolution once the holding period has elapsed.
+        """
+        pending = self.memory_log.get_pending_entries()
         if not pending:
             return
 
         updates = []
         for entry in pending:
-            raw, alpha, days = self._fetch_returns(ticker, entry["date"])
+            raw, alpha, days = self._fetch_returns(entry["ticker"], entry["date"])
             if raw is None:
                 continue
             reflection = self.reflector.reflect_on_final_decision(
@@ -186,7 +208,7 @@ class TradingAgentsGraph:
                 alpha_return=alpha,
             )
             updates.append({
-                "ticker": ticker,
+                "ticker": entry["ticker"],
                 "trade_date": entry["date"],
                 "raw_return": raw,
                 "alpha_return": alpha,
@@ -209,7 +231,11 @@ class TradingAgentsGraph:
         """
         self.ticker = company_name
 
-        self._resolve_pending_entries(company_name)
+        # Reset the per-run vendor call cache so that two separate propagate()
+        # calls on different dates/tickers never share stale cached data.
+        clear_session_cache()
+
+        self._resolve_pending_entries()
 
         if self.config.get("checkpoint_enabled"):
             self._checkpointer_ctx = get_checkpointer(
@@ -277,32 +303,15 @@ class TradingAgentsGraph:
         return final_state, self.process_signal(final_state["final_trade_decision"])
 
     def _log_state(self, trade_date: str, final_state: Dict[str, Any]) -> None:
-        """Persist the final state to a JSON file."""
-        analyst_reports = final_state.get("analyst_reports", {})
+        """Persist the final state to a JSON file.
 
-        self.log_states_dict[str(trade_date)] = {
-            "schema_version": 1,
-            "company_of_interest": final_state["company_of_interest"],
-            "trade_date": final_state["trade_date"],
-            "analyst_reports": analyst_reports,
-            "investment_debate_state": {
-                "bull_history": final_state["investment_debate_state"]["bull_history"],
-                "bear_history": final_state["investment_debate_state"]["bear_history"],
-                "history": final_state["investment_debate_state"]["history"],
-                "current_response": final_state["investment_debate_state"]["current_response"],
-                "judge_decision": final_state["investment_debate_state"]["judge_decision"],
-            },
-            "trader_investment_decision": final_state["trader_investment_plan"],
-            "risk_debate_state": {
-                "aggressive_history": final_state["risk_debate_state"]["aggressive_history"],
-                "conservative_history": final_state["risk_debate_state"]["conservative_history"],
-                "neutral_history": final_state["risk_debate_state"]["neutral_history"],
-                "history": final_state["risk_debate_state"]["history"],
-                "judge_decision": final_state["risk_debate_state"]["judge_decision"],
-            },
-            "investment_plan": final_state["investment_plan"],
-            "final_trade_decision": final_state["final_trade_decision"],
-        }
+        The ``RunSnapshot`` Pydantic model owns the serialisation contract:
+        adding or renaming fields happens in one place (``schemas.py``) and
+        the schema version is baked in, making future migrations mechanical.
+        """
+        snapshot = build_run_snapshot(trade_date, final_state)
+        snapshot_dict = snapshot.model_dump()
+        self.log_states_dict[str(trade_date)] = snapshot_dict
 
         safe_ticker = safe_ticker_component(self.ticker)
         directory = Path(self.config["results_dir"]) / safe_ticker / "TradingAgentsStrategy_logs"
@@ -310,7 +319,7 @@ class TradingAgentsGraph:
 
         log_path = directory / f"full_states_log_{trade_date}.json"
         with open(log_path, "w", encoding="utf-8") as f:
-            json.dump(self.log_states_dict[str(trade_date)], f, indent=4)
+            json.dump(snapshot_dict, f, indent=4)
 
     def process_signal(self, full_signal: str) -> str:
         """Extract the core Buy/Hold/Sell signal from a full decision string."""

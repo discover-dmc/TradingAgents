@@ -1,4 +1,4 @@
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_balance_sheet,
@@ -7,6 +7,8 @@ from tradingagents.agents.utils.agent_utils import (
     get_income_statement,
     get_language_instruction,
 )
+from tradingagents.agents.utils.tool_utils import dispatch_tool_calls
+from tradingagents.agents.prompts import load_prompt
 
 
 def create_fundamentals_analyst(llm):
@@ -19,12 +21,7 @@ def create_fundamentals_analyst(llm):
         llm_with_tools = llm.bind_tools(tools)
         tool_map = {t.name: t for t in tools}
 
-        system_message = (
-            "You are a researcher tasked with analyzing fundamental information over the past week about a company. Please write a comprehensive report of the company's fundamental information such as financial documents, company profile, basic company financials, and company financial history to gain a full view of the company's fundamental information to inform traders. Make sure to include as much detail as possible. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."
-            + " Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."
-            + " Use the available tools: `get_fundamentals` for comprehensive company analysis, `get_balance_sheet`, `get_cashflow`, and `get_income_statement` for specific financial statements."
-            + get_language_instruction()
-        )
+        system_message = load_prompt("fundamentals_analyst") + get_language_instruction()
 
         messages = [
             SystemMessage(
@@ -45,15 +42,7 @@ def create_fundamentals_analyst(llm):
             messages.append(result)
             if not result.tool_calls:
                 break
-            for tc in result.tool_calls:
-                tool_output = tool_map[tc["name"]].invoke(tc["args"])
-                messages.append(
-                    ToolMessage(
-                        content=str(tool_output),
-                        tool_call_id=tc["id"],
-                        name=tc["name"],
-                    )
-                )
+            messages.extend(dispatch_tool_calls(tool_map, result.tool_calls))
 
         return {"analyst_reports": {"fundamentals": result.content}}
 

@@ -1,4 +1,38 @@
-from typing import Annotated
+from __future__ import annotations
+
+import threading
+from typing import Any, Annotated
+
+try:
+    import pandas as pd
+    _DataFrame = pd.DataFrame
+except ImportError:  # pragma: no cover
+    _DataFrame = Any  # type: ignore[assignment,misc]
+
+# ---------------------------------------------------------------------------
+# Session-scoped vendor call cache
+#
+# Identical tool calls within a single propagate() run (e.g. both the social
+# and news analysts calling get_news() with the same ticker/date range) are
+# served from this cache instead of making a second HTTP round-trip.
+#
+# The cache is keyed by (method, positional_args) and is cleared at the start
+# of every propagate() call via clear_session_cache().  Thread-safe: a Lock
+# guards all reads and writes so parallel analyst threads don't race.
+# ---------------------------------------------------------------------------
+
+_session_cache: dict[tuple, Any] = {}
+_session_cache_lock = threading.Lock()
+
+
+def clear_session_cache() -> None:
+    """Reset the per-run vendor call cache.
+
+    Must be called at the start of each ``propagate()`` run so that stale
+    cached results from a previous run are never served.
+    """
+    with _session_cache_lock:
+        _session_cache.clear()
 
 # Import from vendor-specific modules
 from .y_finance import (
@@ -110,15 +144,21 @@ VENDOR_METHODS = {
 }
 
 def get_category_for_method(method: str) -> str:
-    """Get the category that contains the specified method."""
+    """Return the TOOLS_CATEGORIES key that owns *method*.
+
+    Raises ``ValueError`` if the method is not registered in any category.
+    """
     for category, info in TOOLS_CATEGORIES.items():
         if method in info["tools"]:
             return category
     raise ValueError(f"Method '{method}' not found in any category")
 
-def get_vendor(category: str, method: str = None) -> str:
-    """Get the configured vendor for a data category or specific tool method.
-    Tool-level configuration takes precedence over category-level.
+
+def get_vendor(category: str, method: str | None = None) -> str:
+    """Return the configured vendor name for a data category or specific tool.
+
+    Tool-level configuration (``tool_vendors`` key in config) takes precedence
+    over the category-level ``data_vendors`` mapping.
     """
     config = get_config()
 
@@ -131,8 +171,28 @@ def get_vendor(category: str, method: str = None) -> str:
     # Fall back to category-level configuration
     return config.get("data_vendors", {}).get(category, "default")
 
-def route_to_vendor(method: str, *args, **kwargs):
-    """Route method calls to appropriate vendor implementation with fallback support."""
+
+def route_to_vendor(method: str, *args: Any, **kwargs: Any) -> str | _DataFrame:
+    """Route *method* to the appropriate vendor implementation with fallback.
+
+    Tries vendors in priority order (primary first, then remaining available).
+    ``AlphaVantageRateLimitError`` triggers an automatic fallback to the next
+    vendor; all other exceptions propagate.
+
+    Results are stored in the session cache so that identical calls within a
+    single ``propagate()`` run (e.g. two analysts querying the same news for
+    the same ticker) are served from memory rather than making a second HTTP
+    request.  Call :func:`clear_session_cache` to reset between runs.
+
+    Returns the vendor function's result — typically a formatted string or a
+    ``pandas.DataFrame`` depending on the method.
+    """
+    # Positional args only; kwargs are uncommon in this codebase.
+    cache_key = (method,) + args
+    with _session_cache_lock:
+        if cache_key in _session_cache:
+            return _session_cache[cache_key]
+
     category = get_category_for_method(method)
     vendor_config = get_vendor(category, method)
     primary_vendors = [v.strip() for v in vendor_config.split(',')]
@@ -147,6 +207,7 @@ def route_to_vendor(method: str, *args, **kwargs):
         if vendor not in fallback_vendors:
             fallback_vendors.append(vendor)
 
+    result = None
     for vendor in fallback_vendors:
         if vendor not in VENDOR_METHODS[method]:
             continue
@@ -155,8 +216,13 @@ def route_to_vendor(method: str, *args, **kwargs):
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
         try:
-            return impl_func(*args, **kwargs)
+            result = impl_func(*args, **kwargs)
+            break
         except AlphaVantageRateLimitError:
             continue  # Only rate limits trigger fallback
+    else:
+        raise RuntimeError(f"No available vendor for '{method}'")
 
-    raise RuntimeError(f"No available vendor for '{method}'")
+    with _session_cache_lock:
+        _session_cache[cache_key] = result
+    return result
